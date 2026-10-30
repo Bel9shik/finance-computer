@@ -1,0 +1,329 @@
+name: Build draft release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag (must match all application versions)
+        required: true
+        default: v0.23.0
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Require matching tag and locked application versions
+        id: version
+        working-directory: cross-platform
+        run: |
+          python - <<'PY'
+          import json, os, re, tomllib
+          from pathlib import Path
+          tag = os.environ['RELEASE_TAG']
+          assert re.fullmatch(r'v\d+\.\d+\.\d+', tag), 'Expected a stable vX.Y.Z tag'
+          version = tag[1:]
+          package = json.loads(Path('package.json').read_text())
+          lock = json.loads(Path('package-lock.json').read_text())
+          config = json.loads(Path('src-tauri/tauri.conf.json').read_text())
+          cargo = tomllib.loads(Path('src-tauri/Cargo.toml').read_text())
+          cargo_lock = tomllib.loads(Path('src-tauri/Cargo.lock').read_text())
+          locked_package = next(p for p in cargo_lock['package'] if p['name'] == 'finance-computer')
+          versions = [package['version'], lock['version'], lock['packages']['']['version'],
+                      config['version'], cargo['package']['version'], locked_package['version']]
+          assert all(v == version for v in versions), f'Tag {tag} does not match {versions}'
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'version={version}\n')
+          PY
+
+  desktop:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            platform: macOS-universal
+          - os: windows-2022
+            platform: Windows-x64
+          - os: ubuntu-22.04
+            platform: Linux-x64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      RELEASE_VERSION: ${{ needs.version.outputs.version }}
+    defaults:
+      run:
+        working-directory: cross-platform
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: cross-platform/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install both macOS Rust targets
+        if: runner.os == 'macOS'
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - name: Install Linux build and startup-check dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential libxdo-dev libssl-dev librsvg2-dev libayatana-appindicator3-dev patchelf xvfb xauth dbus-x11
+      - run: npm ci
+      - run: python ../Tests/make_fixtures.py
+      - run: npm test
+      - run: cargo test --locked --release --manifest-path src-tauri/Cargo.toml --lib
+      - name: Build universal macOS app and DMG
+        if: runner.os == 'macOS'
+        run: npm run tauri -- build --ci --target universal-apple-darwin --bundles app,dmg -- --locked
+      - name: Check signed macOS bundle startup and offline restrictions
+        if: runner.os == 'macOS'
+        run: |
+          app='src-tauri/target/universal-apple-darwin/release/bundle/macos/Мои финансы.app'
+          lipo -verify_arch arm64 x86_64 "$app/Contents/MacOS/finance-computer"
+          bash scripts/test-macos-startup.sh "$PWD/$app"
+          mkdir -p "$RUNNER_TEMP/release-assets"
+          cp src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg "$RUNNER_TEMP/release-assets/FinanceComputer-$RELEASE_VERSION-macOS-universal.dmg"
+      - name: Build Windows offline installer
+        if: runner.os == 'Windows'
+        run: npm run tauri -- build --ci --bundles nsis -- --locked
+      - name: Install and check Windows release on Windows Server 2022
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $installers = @(Get-ChildItem src-tauri/target/release/bundle/nsis/*-setup.exe)
+          if ($installers.Count -ne 1) { throw 'Expected one NSIS installer' }
+          $installer = $installers[0].FullName
+          $appDir = Join-Path $env:RUNNER_TEMP 'FinanceReleaseApp'
+          $process = Start-Process -FilePath $installer -ArgumentList '/S', "/D=$appDir" -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Installer failed: $($process.ExitCode)" }
+          $binary = Join-Path $appDir 'finance-computer.exe'
+          if (-not (Test-Path $binary)) { throw 'Installed application was not found' }
+          python scripts/test-desktop-startup.py $binary
+          if ($LASTEXITCODE -ne 0) { throw 'Installed Windows app failed its startup/offline check' }
+          $assets = Join-Path $env:RUNNER_TEMP 'release-assets'
+          New-Item -ItemType Directory -Path $assets -Force | Out-Null
+          Copy-Item $installer (Join-Path $assets "FinanceComputer-$env:RELEASE_VERSION-Windows-x64-setup.exe")
+      - name: Build Linux DEB and AppImage
+        if: runner.os == 'Linux'
+        run: APPIMAGE_EXTRACT_AND_RUN=1 npm run tauri -- build --ci --bundles deb,appimage -- --locked
+      - name: Install and check Linux releases and offline restrictions
+        if: runner.os == 'Linux'
+        run: |
+          sudo dpkg -i src-tauri/target/release/bundle/deb/*.deb
+          dbus-run-session -- xvfb-run -a python scripts/test-desktop-startup.py /usr/bin/finance-computer
+          appimage="$(find src-tauri/target/release/bundle/appimage -name '*.AppImage' -print -quit)"
+          APPIMAGE_EXTRACT_AND_RUN=1 dbus-run-session -- xvfb-run -a python scripts/test-desktop-startup.py "$appimage"
+          mkdir -p "$RUNNER_TEMP/release-assets"
+          cp src-tauri/target/release/bundle/deb/*.deb "$RUNNER_TEMP/release-assets/FinanceComputer-$RELEASE_VERSION-Linux-x64.deb"
+          cp "$appimage" "$RUNNER_TEMP/release-assets/FinanceComputer-$RELEASE_VERSION-Linux-x64.AppImage"
+      - name: Save checked installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-${{ matrix.platform }}-${{ env.RELEASE_TAG }}
+          path: ${{ runner.temp }}/release-assets/*
+          if-no-files-found: error
+          retention-days: 14
+
+  android:
+    needs: version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    outputs:
+      signed: ${{ steps.signing.outputs.signed }}
+    env:
+      RELEASE_VERSION: ${{ needs.version.outputs.version }}
+    defaults:
+      run:
+        working-directory: cross-platform
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: cross-platform/package-lock.json
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: android-actions/setup-android@v3
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - run: sdkmanager 'platforms;android-37.0' 'build-tools;37.0.0' 'ndk;30.0.16248370'
+      - run: echo "NDK_HOME=$ANDROID_HOME/ndk/30.0.16248370" >> "$GITHUB_ENV"
+      - run: npm ci
+      - run: npm run android -- --ci --apk --target aarch64 -- --locked
+      - name: Check final APK manifest offline restrictions and release mode
+        run: |
+          apk=src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release-unsigned.apk
+          apkanalyzer manifest print "$apk" > "$RUNNER_TEMP/android-manifest.xml"
+          python - <<'PY'
+          import os, xml.etree.ElementTree as ET
+          root = ET.parse(os.path.join(os.environ['RUNNER_TEMP'], 'android-manifest.xml')).getroot()
+          a = '{http://schemas.android.com/apk/res/android}'
+          assert not any(p.get(a + 'name') == 'android.permission.INTERNET'
+                         for p in root if p.tag.startswith('uses-permission')), 'APK has INTERNET permission'
+          app = root.find('application')
+          for attr in ['allowBackup', 'fullBackupContent', 'usesCleartextTraffic']:
+              assert app.get(a + attr) == 'false', f'Unsafe application setting: {attr}'
+          assert app.get(a + 'debuggable', 'false') == 'false', 'APK is debuggable'
+          assert root.get(a + 'versionName') == os.environ['RELEASE_VERSION'], 'Wrong APK version'
+          PY
+      - name: Optionally restore existing Android signing identity
+        id: signing
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          python - <<'PY'
+          import base64, os
+          from pathlib import Path
+          key = os.environ['ANDROID_KEYSTORE_BASE64']
+          password = os.environ['ANDROID_KEYSTORE_PASSWORD']
+          assert bool(key) == bool(password), 'Provide both Android signing secrets, or neither'
+          if key:
+              assert '\n' not in password and '\r' not in password, 'Password must fit on one line'
+              os.umask(0o077)
+              signing = Path('.local-signing')
+              signing.mkdir(exist_ok=True)
+              (signing / 'release.keystore').write_bytes(base64.b64decode(''.join(key.split()), validate=True))
+              (signing / 'release.password').write_text(password + '\n')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'signed={str(bool(key)).lower()}\n')
+          PY
+      - name: Sign APK with existing key and verify signature
+        if: steps.signing.outputs.signed == 'true'
+        run: |
+          bash scripts/sign-android.sh
+          mkdir -p "$RUNNER_TEMP/release-assets"
+          cp "../build/releases/FinanceComputer-$RELEASE_VERSION-arm64.apk" "$RUNNER_TEMP/release-assets/FinanceComputer-$RELEASE_VERSION-Android-arm64.apk"
+      - name: Save signed release APK
+        if: steps.signing.outputs.signed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-Android-arm64-${{ env.RELEASE_TAG }}
+          path: ${{ runner.temp }}/release-assets/*.apk
+          if-no-files-found: error
+          retention-days: 14
+      - name: Save unsigned APK for local signing (excluded from release assets)
+        if: steps.signing.outputs.signed == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-unsigned-for-local-signing-${{ env.RELEASE_TAG }}
+          path: cross-platform/src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release-unsigned.apk
+          if-no-files-found: error
+          retention-days: 14
+      - name: Remove temporary signing material
+        if: always()
+        run: rm -rf .local-signing
+
+  pwa:
+    needs: version
+    runs-on: ubuntu-24.04
+    env:
+      RELEASE_VERSION: ${{ needs.version.outputs.version }}
+    defaults:
+      run:
+        working-directory: cross-platform
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: cross-platform/package-lock.json
+      - run: npm ci
+      - run: python ../Tests/make_fixtures.py
+      - run: npm test
+      - run: npm run build:pwa
+      - name: Archive only the generated PWA files
+        run: |
+          python - <<'PY'
+          import os, zipfile
+          from pathlib import Path
+          root = Path('dist-pwa')
+          files = sorted(p for p in root.rglob('*') if p.is_file())
+          assert files and (root / 'sw.js').is_file() and (root / 'manifest.webmanifest').is_file()
+          output = Path(os.environ['RUNNER_TEMP']) / 'release-assets'
+          output.mkdir()
+          with zipfile.ZipFile(output / f"FinanceComputer-{os.environ['RELEASE_VERSION']}-PWA.zip", 'w', zipfile.ZIP_DEFLATED) as archive:
+              for file in files:
+                  assert not file.is_symlink(), f'Unexpected symlink: {file}'
+                  archive.write(file, file.relative_to(root))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-PWA-${{ env.RELEASE_TAG }}
+          path: ${{ runner.temp }}/release-assets/*.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  draft-release:
+    needs: [version, desktop, android, pwa]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      ANDROID_SIGNED: ${{ needs.android.outputs.signed }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-assets-*
+          path: release-assets
+          merge-multiple: true
+      - name: Add checksums after every platform passes
+        working-directory: release-assets
+        run: sha256sum -- * > SHA256SUMS.txt
+      - name: Create or update draft only
+        run: |
+          cat > release-notes.txt <<'EOF'
+          Production bundles built from the matching version tag; shared tests and desktop startup/offline probes passed before upload.
+
+          macOS: universal Intel/Apple Silicon, ad-hoc signed; not Apple notarized.
+          Windows: x64 NSIS installer includes the offline WebView2 installer. CI startup checks run on Windows Server 2022; they do not certify Windows 10/11.
+          Linux: x64 DEB and AppImage, built and startup-checked on Ubuntu 22.04.
+          PWA: extracted files require HTTPS or localhost for installation; first installation needs access to that host, then the service worker caches the app for offline use.
+          iOS: unsigned compilation remains a separate manual workflow; no installable iOS release is included.
+          EOF
+          if [ "$ANDROID_SIGNED" = true ]; then
+            printf '\nAndroid: arm64 APK signed with the existing release identity; final manifest has no INTERNET permission. Device runtime checks are separate.\n' >> release-notes.txt
+          else
+            printf '\nDRAFT INCOMPLETE: Android APK must be downloaded from the android-unsigned-for-local-signing workflow artifact, signed locally with the existing key, verified, and added here before publication. Regenerate SHA256SUMS.txt after adding it. Do not publish the unsigned APK.\n' >> release-notes.txt
+          fi
+          if draft=$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft 2>/dev/null); then
+            test "$draft" = true || { echo 'Refusing to overwrite an already published release'; exit 1; }
+            gh release edit "$RELEASE_TAG" --draft --title "Мои финансы $RELEASE_TAG" --notes-file release-notes.txt
+            gh release upload "$RELEASE_TAG" release-assets/* --clobber
+          else
+            gh release create "$RELEASE_TAG" --verify-tag --draft --title "Мои финансы $RELEASE_TAG" --notes-file release-notes.txt release-assets/*
+          fi

@@ -1,0 +1,40 @@
+{
+  "name": "finance-computer",
+  "version": "0.23.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "tsc -b && vite build",
+    "build:pwa": "tsc -b && vite build --mode pwa && node scripts/package-pwa.mjs && node --test tests/pwa-build.test.mjs",
+    "test": "node --import tsx --test tests/*.test.ts",
+    "tauri": "tauri",
+    "desktop": "tauri build",
+    "android": "tauri android build",
+    "ios:init": "bash scripts/tauri.sh ios init",
+    "ios": "bash scripts/tauri.sh ios build"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-dialog": "^2",
+    "@tauri-apps/plugin-fs": "^2",
+    "fast-xml-parser": "^5",
+    "fflate": "^0.8",
+    "json-bigint": "^1",
+    "pdfjs-dist": "^5",
+    "react": "^19",
+    "react-dom": "^19"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2",
+    "@types/json-bigint": "^1",
+    "@types/node": "^24",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "@vitejs/plugin-react": "^4",
+    "prettier": "^3.9.10",
+    "tsx": "^4",
+    "typescript": "^5",
+    "vite": "^7"
+  }
+}

@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Мои финансы
+Exec={{exec}}
+Icon={{icon}}
+Terminal=false
+Categories=Office;Finance;

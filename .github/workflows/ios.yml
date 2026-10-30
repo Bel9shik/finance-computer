@@ -1,0 +1,48 @@
+name: iOS unsigned build check
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  ios:
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: cross-platform
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: cross-platform/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+      - name: Install Xcode project tools
+        run: |
+          brew list xcodegen || brew install xcodegen
+          brew list cocoapods || brew install cocoapods
+      - run: npm ci
+      - run: python3 ../Tests/make_fixtures.py
+      - run: npm test
+      - run: npm run build
+      - run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
+      - name: Check shared UI in macOS WebKit
+        run: |
+          bash scripts/test-webview.sh 390 844
+          bash scripts/test-webview.sh 844 390 dark
+      - run: npm run ios:init -- --ci
+      - name: Compile simulator app
+        run: |
+          if [ "$(uname -m)" = arm64 ]; then
+            npm run ios -- --ci --no-sign --target aarch64-sim
+          else
+            npm run ios -- --ci --no-sign --target x86_64
+          fi
+      - name: Archive unsigned iPhone app
+        run: npm run ios -- --ci --no-sign --archive-only --target aarch64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: finance-ios-unsigned-unverified
+          path: cross-platform/src-tauri/gen/apple/build
+          if-no-files-found: error

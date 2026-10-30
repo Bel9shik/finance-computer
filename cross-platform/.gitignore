@@ -1,0 +1,15 @@
+node_modules/
+dist/
+dist-pwa/
+src-tauri/target/
+src-tauri/gen/schemas/
+src-tauri/gen/apple/
+src-tauri/gen/android/app/src/main/jniLibs/
+src-tauri/gen/android/app/tauri.build.gradle.kts
+src-tauri/gen/android/.kotlin/
+src-tauri/gen/android/app/src/main/java/local/financecomputer/multiplatform/generated/
+*.keystore
+*.jks
+*.password
+.local-signing/
+*.tsbuildinfo

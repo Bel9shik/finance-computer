@@ -1,0 +1,8 @@
+{
+  "productName": "finance-computer",
+  "bundle": {
+    "linux": {
+      "deb": { "desktopTemplate": "linux.desktop" }
+    }
+  }
+}

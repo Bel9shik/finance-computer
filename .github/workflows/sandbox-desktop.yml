@@ -1,0 +1,61 @@
+name: Desktop sandbox releases
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: cross-platform
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: cross-platform/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential libxdo-dev libssl-dev librsvg2-dev libayatana-appindicator3-dev patchelf xvfb xauth dbus-x11
+      - run: npm ci
+      - run: python ../Tests/make_fixtures.py
+      - run: npm test
+      - run: cargo test --release --manifest-path src-tauri/Cargo.toml --lib
+      - if: runner.os == 'Windows'
+        run: npm run tauri -- build --bundles nsis
+      - if: runner.os == 'Linux'
+        run: APPIMAGE_EXTRACT_AND_RUN=1 npm run tauri -- build --bundles deb,appimage
+      - name: Install and check Windows release
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $installer = (Get-ChildItem src-tauri/target/release/bundle/nsis/*-setup.exe | Select-Object -First 1).FullName
+          $appDir = Join-Path $env:RUNNER_TEMP 'FinanceSandboxApp'
+          $process = Start-Process -FilePath $installer -ArgumentList '/S', "/D=$appDir" -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Installer failed: $($process.ExitCode)" }
+          $binary = Join-Path $appDir 'finance-computer.exe'
+          if (-not (Test-Path $binary)) { throw 'Installed application was not found' }
+          python scripts/test-desktop-startup.py $binary
+          if ($LASTEXITCODE -ne 0) { throw 'Installed Windows app failed its sandbox check' }
+      - name: Install and check Linux release
+        if: runner.os == 'Linux'
+        run: |
+          sudo dpkg -i src-tauri/target/release/bundle/deb/*.deb
+          dbus-run-session -- xvfb-run -a python scripts/test-desktop-startup.py /usr/bin/finance-computer
+          APPIMAGE_EXTRACT_AND_RUN=1 dbus-run-session -- xvfb-run -a python scripts/test-desktop-startup.py "$(find src-tauri/target/release/bundle/appimage -name '*.AppImage' -print -quit)"
+      - name: Save installers only after successful checks
+        uses: actions/upload-artifact@v4
+        with:
+          name: finance-${{ runner.os }}-x64
+          retention-days: 14
+          if-no-files-found: error
+          path: |
+            cross-platform/src-tauri/target/release/bundle/nsis/*-setup.exe
+            cross-platform/src-tauri/target/release/bundle/deb/*.deb
+            cross-platform/src-tauri/target/release/bundle/appimage/*.AppImage

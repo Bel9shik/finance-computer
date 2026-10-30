@@ -1,0 +1,14 @@
+{
+  "identifier": "main",
+  "description": "Локальные выписки и резервные копии",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "dialog:allow-open",
+    "dialog:allow-save",
+    "dialog:allow-confirm",
+    "fs:allow-read-file",
+    "fs:allow-write-file",
+    "fs:allow-stat"
+  ]
+}
