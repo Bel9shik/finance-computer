@@ -132,6 +132,8 @@ node --import tsx scripts/audit-classification.ts /path/to/ledger.json
 
 ## Сборка
 
+Актуальные установщики и PWA находятся в [GitHub Releases](https://github.com/Bel9shik/finance-computer/releases/latest). Описания локальных сборок 0.18–0.21 ниже сохранены как история проверок; они не описывают результаты запуска нового релиза на тех же ОС.
+
 Нужны Node.js 24, Rust stable и системные инструменты Tauri. На Mac — Xcode Command Line Tools; для Android — Java 21, Android SDK и NDK. На Windows нужны MSVC Build Tools. На Linux — WebKitGTK 4.1 и библиотеки, перечисленные в CI.
 
 ```sh
@@ -157,6 +159,8 @@ Mac-приложение: `src-tauri/target/release/bundle/macos/Мои фина
 Проверенный Windows x64 установщик находится в `../build/releases/FinanceComputer-0.18.0-x64-setup.exe`. Он включает офлайн WebView2; установка и работа проверены на Windows 10 (19045) и Windows 11 (26300) в отдельных виртуальных машинах без сетевых адаптеров. Цифровой подписи пока нет, поэтому Windows может предупредить о неизвестном издателе. Контрольная сумма — в `../build/releases/SHA256SUMS.txt`, подробности проверки — в `../build/releases/WINDOWS-VERIFICATION.txt`. Установщик собран локально через `cargo-xwin` и NSIS 3.08 с официальным `Include/Win/RestartManager.nsh` (Git blob `6557b7d4e30846077476e9cece8b9324ebb12e42`).
 
 Сборки в `.github/workflows/cross-platform.yml` запускаются вручную и готовят установщики на macOS, Windows и Linux, а также неподписанный Android APK. Workflow не публикует релизы. Личные базы и выписки не должны попадать в репозиторий или CI.
+
+Публикация актуальных пакетов выполняется через `.github/workflows/release.yml`: тег `vX.Y.Z` должен совпадать с версиями npm, Tauri и Cargo. После сборок, тестов и проверок запуска создаётся черновик с SHA-256. Без Android-секретов неподписанный APK остаётся отдельным CI-артефактом; перед публикацией добавляется APK, подписанный локально прежним ключом, и обновляются контрольные суммы. Для Mac собирается universal DMG. Windows CI использует Server 2022, Linux — Ubuntu 22.04; это не заменяет проверки на всех целевых системах. Нативный iOS IPA в этот релизный процесс не входит.
 
 `.github/workflows/sandbox-desktop.yml` собирает Windows x64 и Linux x64, устанавливает полученные пакеты в отдельные виртуальные машины и проверяет готовое приложение. Установщики сохраняются в артефакты только после успешных проверок. Этот workflow также запускается вручную и не публикует публичный релиз. Его `windows-2022` — Windows Server 2022: успешный запуск там не заменяет проверку Windows 10 и 11.
 

@@ -102,7 +102,7 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           app='src-tauri/target/universal-apple-darwin/release/bundle/macos/Мои финансы.app'
-          lipo -verify_arch arm64 x86_64 "$app/Contents/MacOS/finance-computer"
+          lipo "$app/Contents/MacOS/finance-computer" -verify_arch arm64 x86_64
           bash scripts/test-macos-startup.sh "$PWD/$app"
           mkdir -p "$RUNNER_TEMP/release-assets"
           cp src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg "$RUNNER_TEMP/release-assets/FinanceComputer-$RELEASE_VERSION-macOS-universal.dmg"
@@ -172,6 +172,8 @@ jobs:
           distribution: temurin
           java-version: 21
       - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android
