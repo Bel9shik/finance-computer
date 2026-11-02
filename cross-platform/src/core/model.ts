@@ -369,13 +369,17 @@ export function namedInternalTransfer(
     return amount < 0n ? K.outgoing : K.incoming;
 }
 export function cardPurchase(s: string) {
-  const m = s
-    .replace(/\s+/g, " ")
-    .trim()
-    .match(
+  const text = s.replace(/\s+/g, " ").trim(),
+    m = text.match(
       /^Операция по карте:\s*[0-9*Xx• -]+,\s*дата создания транзакции:\s*[0-9]{2}[-.][0-9]{2}[-.][0-9]{4},\s*место совершения операции:\s*(.+),\s*MCC:\s*([0-9]{4})\.?$/i,
     );
-  return m ? { merchant: m[1].trim(), mcc: m[2] } : undefined;
+  if (m) return { merchant: m[1].trim(), mcc: m[2] };
+  const pdf = text.match(
+    /^Операция по карте:\s*[0-9*Xx•+ -]+,\s*на сумму:\s*[0-9]+(?: [0-9]{3})*[.,][0-9]{2}\s+[A-Z]{3},\s*дата совершения операции:\s*[0-9]{2}\.[0-9]{2}\.[0-9]{2}(?:[0-9]{2})?,\s*место совершения операции:\s*[0-9]+\\([A-Z]{2,3}\\[^\\]+\\.+?)\s+\(AP-[0-9A-Z]+\)\s+MCC\s*:?\s*([0-9]{4})\.?$/i,
+  );
+  return pdf
+    ? { merchant: pdf[1].replaceAll("\\", "/").trim(), mcc: pdf[2] }
+    : undefined;
 }
 export function sbpIdentity(s: string) {
   const m = normalize(s).match(
@@ -573,7 +577,10 @@ function purposeSuggestion(
     amount < 0n &&
     (/сберегательный взнос/u.test(t) ||
       /^(?:kopilka|копилка)\s+karta-vklad(?:[ .]|$)/u.test(t) ||
-      (savings && /(?:пополнени|взнос|перевод (?:на|для))/u.test(t)))
+      (savings &&
+        /(?:пополнени|взнос|перевод (?:на|для)|^перечисление средств)/u.test(
+          t,
+        )))
   )
     return { kind: K.savings, category: "Переводы" };
   if (
@@ -1136,16 +1143,26 @@ export function append(
   for (const o of l.operations)
     if (o.bankID && !ids.has(key(o))) ids.set(key(o), o);
   const added: Operation[] = [];
-  let duplicates = 0;
+  let duplicates = 0,
+    differingAlfaDates = 0;
   for (const o of result.operations) {
     const prev = o.bankID && ids.get(key(o));
     if (prev) {
+      // Alfa's PDF/XLSX exports can date the same card purchase one day apart.
+      // The bank code identifies it; retain the existing operation and edits.
+      const alfaDateDifference =
+        o.bank === "Альфа‑Банк" &&
+        /^CRD_/u.test(o.bankID) &&
+        ((/\.pdf$/iu.test(o.source) && /\.xlsx$/iu.test(prev.source)) ||
+          (/\.xlsx$/iu.test(o.source) && /\.pdf$/iu.test(prev.source))) &&
+        Math.abs(Date.parse(o.date) - Date.parse(prev.date)) <= 86400000;
       if (
         prev.amount !== o.amount ||
         prev.currency !== o.currency ||
-        prev.date !== o.date
+        (prev.date !== o.date && !alfaDateDifference)
       )
         throw Error("Операция с тем же банковским кодом изменилась");
+      if (prev.date !== o.date) differingAlfaDates++;
       duplicates++;
     } else {
       added.push({ ...o, possibleDuplicate: old.has(fingerprint(o)) });
@@ -1163,6 +1180,11 @@ export function append(
     count: added.length,
     warnings: [
       ...result.warnings,
+      ...(differingAlfaDates
+        ? [
+            `Дата покупки отличается между PDF и XLSX Альфа‑Банка: ${differingAlfaDates}. Сохранены ранее загруженные операции и их даты.`,
+          ]
+        : []),
       ...(duplicates
         ? [
             `Уже были загружены по банковскому коду: ${duplicates}. Повторно не добавлены.`,

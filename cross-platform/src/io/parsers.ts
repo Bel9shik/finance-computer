@@ -360,6 +360,8 @@ export function parsePDFPages(pages: PDFText[][], filename: string): Parsed {
     norm = normalize(full);
   if (!norm)
     throw Error("В PDF нет текста. Сканированные PDF не поддерживаются");
+  if (/альфа[- ]банк/u.test(norm) && norm.includes("выписка по счету"))
+    return parseAlfaPDF(pages, filename);
   if (
     norm.includes("сбербанк") &&
     norm.includes("выписка по счету дебетовой карты")
@@ -373,7 +375,7 @@ export function parsePDFPages(pages: PDFText[][], filename: string): Parsed {
   )
     return parseTBankPDF(pages, filename, full);
   throw Error(
-    "Формат PDF не распознан. Поддерживаются текстовые выписки Т‑Банка, Пэя и Сбербанка",
+    "Формат PDF не распознан. Поддерживаются текстовые выписки Т‑Банка, Альфа‑Банка, Пэя и Сбербанка",
   );
 }
 const pdfText = (items: PDFText[]) =>
@@ -394,6 +396,203 @@ function pdfLines(items: PDFText[]) {
   }
   for (const line of lines) line.sort((a, b) => a.x - b.x);
   return lines;
+}
+function parseAlfaPDF(pages: PDFText[][], filename: string): Parsed {
+  const first = pages[0].filter((i) => i.str.trim());
+  const label = (pattern: RegExp, items = first) => {
+    const found = items.filter((i) => pattern.test(i.str.trim()));
+    if (found.length !== 1)
+      throw Error("Не найдены однозначные реквизиты или столбцы Альфа‑Банка");
+    return found[0];
+  };
+  const summaryX = label(/^Входящий остаток$/iu).x;
+  const right = (item: PDFText, limit = Infinity) =>
+    pdfText(
+      first
+        .filter(
+          (i) =>
+            Math.abs(i.y - item.y) < 2 &&
+            i.x >= item.x + item.width - 1 &&
+            i.x < limit,
+        )
+        .sort((a, b) => a.x - b.x),
+    );
+  const account = right(label(/^Номер сч[её]та$/iu), summaryX).replace(
+    /\s/g,
+    "",
+  );
+  if (!/^\d{20}$/.test(account))
+    throw Error("Не найден номер счёта Альфа‑Банка");
+  const currency = currencyCode(right(label(/^Валюта сч[её]та$/iu), summaryX));
+  const amountCell = (raw: string) => {
+    const match = raw.match(
+      /^([+−–-]?\s*\d[\d\s]*[.,]\d{2})\s+([A-Z]{3}|₽|\$|€)$/iu,
+    );
+    if (!match) throw Error("Не распознана сумма с валютой Альфа‑Банка");
+    if (currencyCode(match[2]) !== currency)
+      throw Error("Валюта суммы отличается от валюты счёта");
+    return money(match[1]);
+  };
+  const income = amountCell(right(label(/^Поступления$/iu))),
+    expense = amountCell(right(label(/^Расходы$/iu))),
+    opening = amountCell(right(label(/^Входящий остаток$/iu))),
+    closing = amountCell(right(label(/^Исходящий остаток$/iu)));
+  if (income < 0n || expense < 0n || opening + income - expense !== closing)
+    throw Error("Остатки Альфа‑Банка не сошлись с итогами");
+  const period = pdfText(first).match(
+    /За период с (\d{2}\.\d{2}\.\d{4}) по (\d{2}\.\d{2}\.\d{4})/iu,
+  );
+  if (!period) throw Error("Не найден период выписки Альфа‑Банка");
+  const from = operationDate(period[1]),
+    to = operationDate(period[2]);
+  if (from > to) throw Error("Некорректный период выписки Альфа‑Банка");
+  const result: Parsed = { operations: [], warnings: [] };
+  const bankIDs = new Set<string>();
+  for (let p = 0; p < pages.length; p++) {
+    const context = `Страница ${p + 1}`;
+    try {
+      const items = pages[p].filter((i) => i.str.trim()),
+        lines = pdfLines(items);
+      const numbering = lines
+        .map(pdfText)
+        .filter((l) => /^Страница \d+ из \d+$/u.test(l));
+      const number = numbering[0]?.match(/^Страница (\d+) из (\d+)$/u);
+      if (
+        numbering.length !== 1 ||
+        !number ||
+        Number(number[1]) !== p + 1 ||
+        Number(number[2]) !== pages.length
+      )
+        throw Error("В выписке пропущена или повторена страница");
+      const header = lines.find((l) =>
+        l.some((i) => i.str.trim() === "Дата проводки"),
+      );
+      if (!header) throw Error("Не найден заголовок таблицы Альфа‑Банка");
+      const dateX = label(/^Дата проводки$/iu, header).x,
+        codeX = label(/^Код операции$/iu, header).x,
+        descriptionX = label(/^Описание$/iu, header).x,
+        amountX = label(/^Сумма$/iu, header).x;
+      const subheader = label(/^в валюте сч[её]та$/iu, items);
+      if (!(
+        dateX < codeX &&
+        codeX < descriptionX &&
+        descriptionX < subheader.x &&
+        subheader.x <= amountX &&
+        subheader.y < header[0].y
+      ))
+        throw Error("Неизвестное расположение столбцов Альфа‑Банка");
+      const signer = lines.findIndex((l) =>
+        l.some((i) => i.str.trim() === "Уполномоченное лицо"),
+      );
+      const footer = lines[signer - 1];
+      if (
+        !footer ||
+        !/^(?:(?:\p{Lu}\.\s*){2}\p{Lu}[\p{L}-]+|\p{Lu}[\p{L}-]+\s+(?:\p{Lu}\.\s*){2})$/u.test(
+          pdfText(footer),
+        ) ||
+        footer.some((item) => item.x <= descriptionX + 1) ||
+        footer[0].y - lines[signer][0].y > 20 ||
+        !lines.some((l) =>
+          /подпись сотрудника.*альфа[- ]банк/iu.test(pdfText(l)),
+        )
+      )
+        throw Error("Не найден конец таблицы Альфа‑Банка");
+      const body = lines.filter(
+        (l) => l[0].y < subheader.y - 2 && l[0].y > footer[0].y + 2,
+      );
+      const dateItems = (l: PDFText[]) =>
+        l.filter((i) => i.x >= dateX - 1 && i.x < codeX - 1);
+      const codeItems = (l: PDFText[]) =>
+        l.filter((i) => i.x >= codeX - 1 && i.x < descriptionX - 1);
+      // Right-aligned amounts can start left of the column title. Find the
+      // numeric suffix instead of guessing a fixed x-coordinate for its start.
+      const amountItems = (l: PDFText[]) => {
+        let found: PDFText[] = [];
+        for (let i = l.length - 1; i >= 0 && l[i].x > descriptionX + 1; i--) {
+          if (
+            /^[+−–-]?\s*\d[\d\s]*[.,]\d{2}\s+(?:[A-Z]{3}|₽|\$|€)$/iu.test(
+              pdfText(l.slice(i)),
+            )
+          )
+            found = l.slice(i);
+        }
+        return found;
+      };
+      const starts = body.filter(
+        (l) =>
+          dateItems(l).length || codeItems(l).length || amountItems(l).length,
+      );
+      if (!starts.length || starts[0] !== body[0])
+        throw Error("Не найдены полные строки операций");
+      for (let i = 0; i < starts.length; i++) {
+        const start = starts[i],
+          rawDate = pdfText(dateItems(start)),
+          code = pdfText(codeItems(start)),
+          amounts = amountItems(start);
+        const postingDate = operationDate(rawDate);
+        if (postingDate < from || postingDate > to)
+          throw Error("Дата проводки вне периода выписки");
+        if (!/^[A-Z0-9_/-]+$/iu.test(code) || bankIDs.has(code))
+          throw Error("Пустой или повторный код операции");
+        bankIDs.add(code);
+        if (!amounts.length) throw Error("Не найдена сумма операции");
+        const row = body.filter(
+          (l) =>
+            l[0].y <= start[0].y + 2 &&
+            l[0].y > (starts[i + 1]?.[0].y ?? footer[0].y) + 2,
+        );
+        const details = pdfText(
+          row.flatMap((l) =>
+            l.filter(
+              (item) =>
+                item.x >= descriptionX - 1 &&
+                (l !== start || item.x < amounts[0].x),
+            ),
+          ),
+        );
+        if (!details) throw Error("Пустое описание операции");
+        const originalDate = details.match(
+          /дата совершения операции:\s*(\d{2}\.\d{2}\.)(\d{4}|\d{2})(?!\d)/iu,
+        );
+        let date = postingDate;
+        if (originalDate) {
+          // Resolve the nearest century, then reject a purchase in the future.
+          const year = Number(postingDate.slice(0, 4));
+          const originalYear =
+            originalDate[2].length === 4
+              ? Number(originalDate[2])
+              : Math.round((year - Number(originalDate[2])) / 100) * 100 +
+                Number(originalDate[2]);
+          date = operationDate(originalDate[1] + String(originalYear));
+          if (date > postingDate)
+            throw Error("Дата покупки позже даты проводки");
+        } else if (/дата совершения операции:/iu.test(details))
+          throw Error("Не распознана дата покупки");
+        const amount = amountCell(pdfText(amounts));
+        result.operations.push({
+          id: uuid(),
+          date,
+          bank: "Альфа‑Банк",
+          account,
+          details,
+          amount,
+          currency,
+          ...suggest(details, amount),
+          mcc: extractMCC(details),
+          source: filename,
+          sourceRow: `${context}, операция ${i + 1}; проводка ${postingDate}`,
+          bankID: code,
+          possibleDuplicate: false,
+        });
+      }
+    } catch (e) {
+      throw Error(
+        `${context}: ${e instanceof Error ? e.message : e}. Файл не импортирован.`,
+      );
+    }
+  }
+  reconcile(result.operations, income, expense, currency, true);
+  return result;
 }
 function parseSberPDF(pages: PDFText[][], filename: string): Parsed {
   const result: Parsed = { operations: [], warnings: [] };

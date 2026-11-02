@@ -74,7 +74,7 @@ self.onmessage = async ({
       }
     } else
       throw Error(
-        "Поддерживаются PDF Т‑Банка, Пэя и Сбербанка, XLSX Альфа‑Банка",
+        "Поддерживаются PDF Т‑Банка, Альфа‑Банка, Пэя и Сбербанка, XLSX Альфа‑Банка",
       );
     self.postMessage({ type: "finance-import", result, digest });
   } catch (e) {

@@ -142,6 +142,7 @@ export function merchantCategory(details: string): string | undefined {
     details.match(/^(.+?)\.\s*Операция по карте\s+\*{4}\d{4}$/iu)?.[1];
   if (!raw) return;
   const name = raw
+    .replace(/^\d+\\[A-Z]{2,3}\\[^\\]+\\/i, "")
     .replace(/^[A-Z]{2,3}\/[^/]+\//i, "")
     .toLowerCase()
     .replace(/ё/g, "е")
